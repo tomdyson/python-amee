@@ -121,6 +121,7 @@ class AMEE(object):
     )
     
     if response.status_code not in (200, 201, 401):
+      logging.error("Error response from AMEE: %s", response.content)
       raise APIError("Status code %d from %s to %s" % (response.status_code, method, path))
 
     return response
@@ -158,11 +159,6 @@ class AMEE(object):
     '''Return a list of all profiles.'''
     return [ Profile(self, profile["uid"]) for profile in self.request("/profiles", "GET")["profiles"] ]
   
-  def delete_profile(self, uid):
-    '''Delete an AMEE profile, given the UID.
-    '''
-    self.request("/profiles/" + uid, "DELETE")
-  
   def drill(self, path, choices, complete=False):
     '''Perform a data item drilldown.
     
@@ -175,6 +171,10 @@ class AMEE(object):
     are incomplete. In this case the return value will always be the UID.
     
     Results are cached using memcache.
+    
+    Typical applications will not call this method directly: it is used internally
+    by Profile.create_item(s). You could call it directly if you wanted to allow
+    a user to specify data items interactively one choice at a time.
     '''
     choices_string = urllib.urlencode(choices)
     memcache_key = ";".join((self.server, path, choices_string, str(complete)))
@@ -189,8 +189,10 @@ class AMEE(object):
   def _drill(self, path, choices_string, complete=False):
     '''Perform the drilldown directly, without caching.
     '''
+    if not path.startswith("/"):
+      raise Error("Path '%s' does not start with /" % (path,))
     r_choices = self.request("/data" + path + "/drill?" + choices_string)["choices"]
-    
+
     # The "choices" item is an array of dicts with keys "name" and "value", which
     # appear always to be identical. We simplify this structure by replacing each
     # such choice with its name.
@@ -204,9 +206,20 @@ class AMEE(object):
       return uid
     
     if complete:
-      raise Error("Incomplete drilldown, '%s' must be specified" % (r_choices["name"],))
+      raise Error("Incomplete drilldown, '%s' must be specified; possible values are %s" % (
+        r_choices["name"], r_choices["choices"]))
 
     return r_choices
+  
+  def fly(self, path, choices, values):
+    '''Perform an on-the-fly calculation. The parameters are interpreted as in Profile.create_item,
+    but this method does not require a profile or create any profile items. The return value is
+    the total carboon footprint of the item, measured in kg / year of carbon dioxide.
+    '''
+    uid = self.drill(path, choices)
+    values_encoded = urllib.urlencode(values)
+
+    return self.request("/data" + path + "/" + uid + "?" + values_encoded,)["amount"]["value"]
 
 class Profile(object):
   def __init__(self, api, uid):
@@ -218,10 +231,19 @@ class Profile(object):
     '''
     if self.uid is None:
       raise Error("Profile has already been deleted")
-    self.api.delete_profile(self.uid)
+    self.api.request("/profiles/" + self.uid, "DELETE")
     self.uid = None
 
   def create_item(self, path, choices, values):
+    '''Create a profile item, given the path and drilldown choices for the data item.
+    
+    For example, you could record five long-haul return flights as follows:
+    
+    long_haul_flights = profile.create_item("/transport/plane/generic",
+      { "type": "long haul", "size": "return" },
+      { "journeys": 5 }
+    )
+    '''
     if self.uid is None:
       raise Error("Profile has been deleted")
     if not path.startswith("/"):
@@ -246,6 +268,10 @@ class Profile(object):
     but more efficient, because it uses the AMEE batch update API. (One behaviour
     difference is that create_items is atomic, so that if one of the items fails then
     none of them will be created.)
+    
+    common_values are values that are passed for each item, unless overridden in
+    an individual item. (You could pass the startDate and endDate / duration here,
+    for example.)
     
     The return value is an array of ProfileItem objects, one for each item created.
     '''
@@ -277,7 +303,7 @@ class ProfileItem(object):
     return self.api.request(self.uri, "GET")
   
   def co2(self):
-    '''The amount of Carbon Dioxide represented by this profile item,
+    '''The amount of carbon dioxide represented by this profile item,
     in kilograms per year.
     '''
     amount = self.get()["profileItem"]["amount"]
